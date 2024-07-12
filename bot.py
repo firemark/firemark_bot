@@ -2,85 +2,22 @@
 
 # flake8: noqa F401
 from collections.abc import Callable
+from functools import partial
 from random import random
 
 import numpy as np
 from scipy import ndimage
-from PIL import Image, ImageDraw
 
 from vendeeglobe import (
     Checkpoint,
-    Heading,
     Instructions,
     Location,
     Vector,
     config,
 )
-from vendeeglobe.utils import distance_on_surface, wind_force
+from vendeeglobe.utils import distance_on_surface, wind_force, goto
 
-
-SCALE = 4
-WINDOW = 1
-EARTH_RADIUS = 6_371.00
-DEG_TO_KM = 111
-SHIFT = -30
-SIZE = (360 * SCALE, 360 * SCALE)
-
-np.set_printoptions(linewidth=320)
-
-def make_image(courses: list[Checkpoint]) -> np.ndarray:
-    img = Image.new('F', SIZE, color=0.0)
-    drw = ImageDraw.Draw(img)
-    distance = 0.0
-    for a, b in zip(courses[0:], courses[1:]):
-        a_lat = np.radians(a.latitude)
-        b_lat = np.radians(b.latitude)
-        a_lon = np.radians(a.longitude)
-        b_lon = np.radians(b.longitude)
-
-        _xa = np.cos(a_lat) * np.cos(a_lon)
-        _xb = np.cos(b_lat) * np.cos(b_lon)
-        _ya = np.cos(a_lat) * np.sin(a_lon)
-        _yb = np.cos(b_lat) * np.sin(b_lon)
-        _za = np.sin(a_lat)
-        _zb = np.sin(b_lat)
-
-        diff_radius = (b.radius - a.radius) / DEG_TO_KM * SCALE
-        ab_distance = distance_on_surface(a.longitude, a.latitude, b.longitude, b.latitude)
-
-        d_lat = b_lat - a_lat
-        d_lon = b_lon - b_lon
-
-        calc_a = np.sin(d_lat / 2) ** 2 + np.cos(a_lat) * np.cos(b_lat) * np.sin(d_lon / 2) ** 2
-        calc_b = 2 * np.atan2(np.sqrt(calc_a), np.sqrt(1 - calc_a))
-
-        rest_distance = ab_distance
-        while rest_distance > 0.0:
-            ratio = rest_distance / ab_distance
-            radius = a.radius  / DEG_TO_KM * SCALE + diff_radius * (1 - ratio)
-
-            _a = np.sin(ratio * calc_b) / np.sin(calc_b)
-            _b = np.sin((1 - ratio) * calc_b) / np.sin(calc_b)
-
-            x = _a * _xa + _b * _xb
-            y = _a * _ya + _b * _yb
-            z = _a * _za + _b * _zb
-
-            lat = np.atan2(z, np.sqrt(x**2 + y**2))
-            lon = np.atan2(y, x)
-
-            # mx = np.pi + lon
-            # my = np.pi - np.log(np.tan(np.pi / 4 + lat / 2))
-            v = SCALE * ((np.degrees(np.array([lon, lat])) + [SHIFT, 180]) % 360)
-            # print(np.degrees(lat), np.degrees(lon), v)
-
-            drw.circle(v, fill=distance, radius=radius)
-
-            distancelet = min(rest_distance, 10.0)
-            distance += distancelet
-            rest_distance -= distancelet
-
-    return np.asarray(img)
+from .mapee import Mapee, SHIFT
 
 
 class Bot:
@@ -101,7 +38,7 @@ class Bot:
             Checkpoint(8.944915, -27.085383, radius=850.0),
             Checkpoint(-54.721834, -47.141871, radius=850.0),
             Checkpoint(-59.969150, -84.645305, radius=550.0),
-            Checkpoint(-8.329906, -105.442150, radius=800.0),
+            # Checkpoint(-8.329906, -105.442150, radius=800.0),
             Checkpoint(2.806318, -168.943864, radius=1800.0),
             Checkpoint(-11.105436, 171.859256, radius=400.0),
             Checkpoint(-31.290107, 169.046756, radius=450.0),
@@ -109,7 +46,11 @@ class Bot:
             Checkpoint(-15.668984, 77.674694, radius=1000.0),
         ]
 
-        self.map = make_image(self.course)
+        self.mapees = [
+            Mapee.make(self.course, scale=1.0, window=5),
+            Mapee.make(self.course, scale=2.0, window=2),
+            Mapee.make(self.course, scale=4.0, window=2),
+        ]
         self.escape = 0.0
         self.old_m = [0, 0]
 
@@ -125,57 +66,9 @@ class Bot:
         forecast: Callable,
         world_map: Callable,
     ) -> Instructions:
-        """
-        This is the method that will be called at every time step to get the
-        instructions for the ship.
-
-        Parameters
-        ----------
-        t:
-            The current time in hours.
-        dt:
-            The time step in hours.
-        longitude:
-            The current longitude of the ship.
-        latitude:
-            The current latitude of the ship.
-        heading:
-            The current heading of the ship.
-        speed:
-            The current speed of the ship.
-        vector:
-            The current heading of the ship, expressed as a vector.
-        forecast:
-            Method to query the weather forecast for the next 5 days.
-            Example:
-            current_position_forecast = forecast(
-                latitudes=latitude, longitudes=longitude, times=0
-            )
-        world_map:
-            Method to query map of the world: 1 for sea, 0 for land.
-            Example:
-            current_position_terrain = world_map(
-                latitudes=latitude, longitudes=longitude
-            )
-
-        Returns
-        -------
-        instructions:
-            A set of instructions for the ship. This can be:
-            - a Location to go to
-            - a Heading to point to
-            - a Vector to follow
-            - a number of degrees to turn Left
-            - a number of degrees to turn Right
-
-            Optionally, a sail value between 0 and 1 can be set.
-        """
         # Initialize the instructions
         instructions = Instructions()
         instructions.sail = 1.0
-
-        mx = int(SCALE * ((longitude + SHIFT) % 360))
-        my = int(SCALE * ((latitude + 180) % 360))
         m = [longitude, latitude]
 
         if self.escape > 0.0:
@@ -194,26 +87,40 @@ class Bot:
             return instructions
 
         self.old_m = m
-        lon_range = np.arange(-WINDOW, WINDOW, 1/SCALE) + longitude
+        get_vec_from_mapee = partial(self._get_vec_from_mapee, latitude, longitude, world_map, forecast)
+        a, b, c = [get_vec_from_mapee(mapee) for mapee in self.mapees]
+        v = a + b * 0.5 + c * 0.25
+        instructions.vector = Vector(u=v[0], v=v[1])
+        return instructions
 
-        w = self.map.shape[0]
-        h = self.map.shape[1]
-        part_map_x = slice(np.mod(mx-WINDOW*SCALE, w), np.mod(mx+WINDOW*SCALE, w))
-        part_map_y = slice(np.mod(my-WINDOW*SCALE, h), np.mod(my+WINDOW*SCALE, h))
+    def _get_vec_from_mapee(self, latitude: float, longitude: float, world_map, forecast, mapee: Mapee) -> np.ndarray:
+        window = mapee.window
+        scale = mapee.scale
+        lon_range = np.arange(-window, window, 1/scale) + longitude
 
-        if part_map_x.start > part_map_x.stop:
-            part_map_x = slice(part_map_x.stop, part_map_x.start)
-        if part_map_y.start > part_map_y.stop:
-            part_map_y = slice(part_map_y.stop, part_map_y.start)
+        mx = int(scale * ((longitude + SHIFT) % 360))
+        my = int(scale * ((latitude + 180) % 360))
 
-        part_map = self.map[part_map_y, part_map_x].copy()
+        w = mapee.map.shape[0]
+        h = mapee.map.shape[1]
+
+        def slice_(m_, d_):
+            s = slice(
+                np.mod(m_-window*scale, d_).astype(int), 
+                np.mod(m_+window*scale, d_).astype(int),
+            )
+            if s.start > s.stop:
+                return slice(s.stop, s.start)
+            return s
+
+        part_map_x = slice_(mx, w)
+        part_map_y = slice_(my, h)
+        part_map = mapee.map[part_map_y, part_map_x].copy()
 
         try:
             world = np.zeros(part_map.shape)
-            for col in range(WINDOW * 2 * SCALE):
-                _lat = latitude  + (col/SCALE - WINDOW)
-                # print(part_map[col], current_position_terrain)
-                # part_map[col] *= current_position_terrain
+            for col in range(int(window * 2 * scale)):
+                _lat = latitude  + (col/scale - window)
                 world[col] = world_map(latitudes=_lat, longitudes=lon_range)
             part_map *= world
         except (ValueError, IndexError):
@@ -230,8 +137,8 @@ class Bot:
         gradient = np.dstack([gradient_u, gradient_v]).astype(np.float64)
         try:
             wind = np.zeros(part_map.shape)
-            for col in range(WINDOW * 2 * SCALE):
-                _lat = latitude  + (col/SCALE - WINDOW)
+            for col in range(int(window * 2 * scale)):
+                _lat = latitude  + (col/scale - window)
                 uwind, vwind = forecast(latitudes=_lat, longitudes=lon_range, times=0)
                 fort = np.column_stack([uwind, vwind])
                 arr = [wind_force(g, f) for f, g in zip(fort, gradient[col])]
@@ -249,18 +156,22 @@ class Bot:
 
 
         best_y, best_x = np.unravel_index(np.argmax(part_map), part_map.shape)
-        best_lon = longitude + best_x/SCALE - WINDOW
-        best_lat = latitude + best_y/SCALE - WINDOW
+        best_lon = longitude + best_x/scale - window
+        best_lat = latitude + best_y/scale - window
 
-        instructions.location = Location(
-           latitude=best_lat,
-           longitude=best_lon,
-        )
-        return instructions
+        bearing = np.radians(goto(
+            origin=Location(longitude, latitude),
+            to=Location(best_lon, best_lat),
+        ))
+
+        return np.array([np.cos(bearing), np.sin(bearing)])
 
 
 if __name__ == "__main__":
+    # For testing generated map only. Go away.
+    from PIL import Image
     b = Bot()
-    map = (255 * b.map / b.map.max()).astype(np.uint8)
+    map = b.mapees[0].map
+    map = (255 * map / map.max()).astype(np.uint8)
     img = Image.fromarray(map, 'L')
     img.save(open("wtf.png", "bw"))
